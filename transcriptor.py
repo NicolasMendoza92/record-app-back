@@ -11,7 +11,9 @@ from datetime import datetime
 
 try:
     from faster_whisper import WhisperModel
+    from faster_whisper.audio import decode_audio
     from pyannote.audio import Pipeline
+    import torch
     import anthropic
     from dotenv import load_dotenv
     from rich.console import Console
@@ -105,12 +107,22 @@ def diarizar(audio_path: str, num_speakers: int | None = None):
         p.add_task("Detectando speakers...", total=None)
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token=HF_TOKEN,
+            token=HF_TOKEN,   # pyannote 4.x renombró use_auth_token -> token
         )
+
+        # Cargamos el audio a memoria con el decoder de faster-whisper (PyAV),
+        # que ya funciona con .m4a en Windows. Así evitamos que pyannote intente
+        # decodificar desde la ruta con torchcodec/FFmpeg (no disponible en Windows).
+        audio = decode_audio(audio_path, sampling_rate=16000)
+        waveform = torch.from_numpy(audio).unsqueeze(0)  # (channel=1, time)
+
         kwargs = {}
         if num_speakers:
             kwargs["num_speakers"] = num_speakers
-        diarization = pipeline(audio_path, **kwargs)
+        diarization = pipeline(
+            {"waveform": waveform, "sample_rate": 16000},
+            **kwargs,
+        )
 
     ok("Diarización completada")
     return diarization

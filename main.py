@@ -4,6 +4,7 @@ Archivo: back/main.py  (el Procfile y Render apuntan a este)
 """
 
 import os
+import logging
 import tempfile
 from pathlib import Path
 
@@ -19,6 +20,9 @@ from transcriptor import (
     formatear_transcripcion,
     generar_acta,
 )
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("transcriptor")
 
 app = FastAPI(title="Transcriptor API", version="1.0.0")
 
@@ -84,7 +88,9 @@ async def endpoint_transcribir(
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Log del traceback completo en el servidor (antes solo se veía "500").
+        logger.exception("Fallo procesando /transcribir")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
     finally:
         Path(tmp_path).unlink(missing_ok=True)
