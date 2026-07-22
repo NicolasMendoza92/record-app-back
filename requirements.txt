@@ -1,26 +1,14 @@
-# Transcripción — faster-whisper tiene wheels oficiales para Windows/macOS/Linux
-faster-whisper
- 
-# Diarización — pyannote 3.x sí tiene wheels para Windows
-pyannote.audio>=3.1.0
- 
-# torch CPU (sin CUDA) — la versión CPU-only pesa mucho menos
-# En Windows ejecutá esto en lugar de la línea de abajo:
-#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-torch
-torchaudio
- 
-# HuggingFace (para descargar el modelo de pyannote)
-huggingface_hub
- 
+# Transcripción en la nube (STT) — proveedor por defecto: AssemblyAI
+assemblyai
+
 # API y servidor
 fastapi
 uvicorn[standard]
 python-multipart
- 
-# Claude
+
+# Claude (generación del acta)
 anthropic
- 
+
 # Utilidades
 python-dotenv
 rich

@@ -5,26 +5,18 @@ Archivo: back/main.py  (el Procfile y Render apuntan a este)
 
 import os
 import logging
-import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from transcriptor import (
-    validar_entorno,
-    transcribir,
-    diarizar,
-    mergear,
-    formatear_transcripcion,
-    generar_acta,
-)
+from transcriptor import transcribir_audio, generar_acta
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("transcriptor")
 
-app = FastAPI(title="Transcriptor API", version="1.0.0")
+app = FastAPI(title="Transcriptor API", version="2.0.0")
 
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 
@@ -59,38 +51,28 @@ async def endpoint_transcribir(
     if ext not in extensiones_ok:
         raise HTTPException(status_code=400, detail=f"Formato no soportado: {ext}")
 
-    # guardar temporalmente en disco (faster-whisper necesita path, no stream)
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-        contenido = await audio.read()
-        tmp.write(contenido)
-        tmp_path = tmp.name
+    audio_bytes = await audio.read()
 
     try:
-        validar_entorno()
-        segmentos    = transcribir(tmp_path)
-        diarization  = diarizar(tmp_path, num_speakers=speakers)
-        segments     = mergear(segmentos, diarization)
-        transcripcion = formatear_transcripcion(segments)
-        acta         = generar_acta(transcripcion, segments)
+        # 'speakers' del front se usa como número de hablantes esperado.
+        stt = transcribir_audio(audio_bytes, n_speakers=speakers)
 
-        duracion_min = 0
-        if segments:
-            secs = segments[-1]["end"] - segments[0]["start"]
-            duracion_min = max(1, int(secs // 60))
+        duracion_min = max(1, int(stt.duracion_seg // 60)) if stt.duracion_seg else 0
 
-        n_speakers = len(set(s["speaker"] for s in segments))
+        acta = generar_acta(
+            stt.texto,
+            duracion_min=duracion_min,
+            n_speakers=stt.n_speakers,
+        )
 
         return ResultadoTranscripcion(
-            transcripcion=transcripcion,
+            transcripcion=stt.texto,
             acta=acta,
             duracion_min=duracion_min,
-            n_speakers=n_speakers,
+            n_speakers=stt.n_speakers,   # cantidad detectada por el proveedor
         )
 
     except Exception as e:
         # Log del traceback completo en el servidor (antes solo se veía "500").
         logger.exception("Fallo procesando /transcribir")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
