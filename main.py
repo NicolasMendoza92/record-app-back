@@ -46,7 +46,7 @@ async def endpoint_transcribir(
     audio: UploadFile = File(...),
     speakers: int = Form(default=2, ge=1, le=10),
 ):
-    extensiones_ok = {".mp3", ".m4a", ".mp4", ".wav", ".ogg", ".flac"}
+    extensiones_ok = {".mp3", ".m4a", ".mp4", ".wav", ".ogg", ".flac", ".webm", ".opus"}
     ext = Path(audio.filename or "").suffix.lower()
     if ext not in extensiones_ok:
         raise HTTPException(status_code=400, detail=f"Formato no soportado: {ext}")
