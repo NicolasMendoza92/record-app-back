@@ -10,7 +10,6 @@ queda stubeado para agregarse más adelante.
 """
 
 import os
-import io
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -46,22 +45,25 @@ class ResultadoSTT:
 
 
 # ── capa de transcripción (agnóstica del proveedor) ───────────────────────────
-def transcribir_audio(audio_bytes: bytes, n_speakers: int) -> ResultadoSTT:
+def transcribir_audio(audio_path: str, n_speakers: int) -> ResultadoSTT:
     """
     Transcribe el audio con el proveedor activo (STT_PROVIDER) y devuelve el
     texto formateado por hablante junto con metadata (speakers, duración).
+
+    Recibe la RUTA a un archivo temporal (no los bytes) para no cargar el audio
+    entero en memoria; el SDK del proveedor lo sube desde el disco.
     """
     if STT_PROVIDER == "assemblyai":
-        return _transcribir_assemblyai(audio_bytes, n_speakers)
+        return _transcribir_assemblyai(audio_path, n_speakers)
     if STT_PROVIDER == "deepgram":
-        return _transcribir_deepgram(audio_bytes, n_speakers)
+        return _transcribir_deepgram(audio_path, n_speakers)
     raise ValueError(
         f"STT_PROVIDER desconocido: '{STT_PROVIDER}'. Usá 'assemblyai' o 'deepgram'."
     )
 
 
 # ── proveedor primario: AssemblyAI ────────────────────────────────────────────
-def _transcribir_assemblyai(audio_bytes: bytes, n_speakers: int) -> ResultadoSTT:
+def _transcribir_assemblyai(audio_path: str, n_speakers: int) -> ResultadoSTT:
     """
     AssemblyAI: consciente del solapamiento y acepta el número de hablantes
     esperado (speakers_expected) para mejorar la diarización. El SDK sube el
@@ -82,7 +84,7 @@ def _transcribir_assemblyai(audio_bytes: bytes, n_speakers: int) -> ResultadoSTT
         speakers_expected=n_speakers,   # la reunión sabe cuántos son; se usa tal cual
     )
 
-    transcript = aai.Transcriber().transcribe(io.BytesIO(audio_bytes), config)
+    transcript = aai.Transcriber().transcribe(audio_path, config)
 
     if transcript.status == aai.TranscriptStatus.error:
         raise RuntimeError(f"AssemblyAI falló la transcripción: {transcript.error}")
@@ -111,7 +113,7 @@ def _transcribir_assemblyai(audio_bytes: bytes, n_speakers: int) -> ResultadoSTT
 
 
 # ── proveedor secundario: Deepgram (stub) ─────────────────────────────────────
-def _transcribir_deepgram(audio_bytes: bytes, n_speakers: int) -> ResultadoSTT:
+def _transcribir_deepgram(audio_path: str, n_speakers: int) -> ResultadoSTT:
     """
     Placeholder para agregar Deepgram como segundo proveedor.
     Nota: Deepgram NO acepta un número de hablantes esperado, así que
@@ -160,14 +162,70 @@ Generá un acta en Markdown con exactamente esta estructura:
 (Solo si hay algo relevante que no entra arriba; si no, omití esta sección. Marcá lo dudoso como [inaudible].)
 """
 
-def generar_acta(transcripcion: str, duracion_min: int, n_speakers: int) -> str:
-    """Genera el acta estructurada en Markdown con Claude (Sonnet)."""
+# Ancla del ACTA_PROMPT: el bloque de asistentes se inserta JUSTO antes de esta
+# línea (dentro del prompt de usuario), sólo cuando hay nombres.
+_ANCLA_INSTRUCCIONES = "Generá un acta en Markdown con exactamente esta estructura:"
+
+
+def _bloque_nombres(nombres: list[str]) -> str:
+    """Sección delimitada con la lista de asistentes y las reglas para usarla."""
+    lista = "\n".join(f"- {n}" for n in nombres)
+    return (
+        "=== ASISTENTES A LA REUNIÓN (lista provista por el usuario) ===\n"
+        "Nombres propios de quienes asistieron:\n"
+        f"{lista}\n\n"
+        "Reglas para usar esta lista al redactar el acta:\n"
+        "1. ORTOGRAFÍA CANÓNICA: usá exactamente estas grafías al nombrar responsables. "
+        "Si en la transcripción aparece un diminutivo o una variante fonética que claramente "
+        "corresponde a alguien de la lista, normalizalo a la grafía de la lista.\n"
+        "2. LA LISTA NO ES OBLIGATORIA: es la lista de quienes asistieron, no de quienes tienen "
+        "tareas. Si una acción no tiene un responsable claro en la transcripción, poné "
+        "\"sin asignar\". NO asignes una acción a alguien de la lista sólo porque su nombre está "
+        "disponible. Es preferible \"sin asignar\" que un responsable equivocado.\n"
+        "3. LA LISTA NO ES CERRADA: si en el audio se menciona a alguien que no está en la lista, "
+        "usalo igual tal como se escuchó y marcalo con [no listado].\n\n"
+        "Sobre las etiquetas SPEAKER: asociá una etiqueta SPEAKER a un nombre real SÓLO cuando "
+        "haya evidencia explícita en el audio (alguien se presenta, o lo interpelan por su nombre). "
+        "Si no hay evidencia, dejá la etiqueta SPEAKER como está. Está prohibido inferir el nombre "
+        "por el orden de aparición o por la cantidad de participación.\n"
+        "=== FIN ASISTENTES ===\n"
+    )
+
+
+def generar_acta(
+    transcripcion: str,
+    duracion_min: int,
+    n_speakers: int,
+    nombres: list[str] | None = None,
+) -> str:
+    """Genera el acta estructurada en Markdown con Claude (Sonnet).
+
+    'nombres' es opcional: la lista (saneada) de asistentes provista por el
+    usuario. Si viene vacía o None, el prompt queda EXACTAMENTE como sin la
+    feature (no se agrega ninguna sección).
+    """
     step("Generando acta estructurada con Claude...")
 
     if not ANTHROPIC_KEY:
         raise RuntimeError("ANTHROPIC_API_KEY no está configurada en el entorno")
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+    prompt_usuario = ACTA_PROMPT.format(
+        transcripcion=transcripcion,
+        fecha=datetime.now().strftime("%d/%m/%Y"),
+        duracion=f"~{duracion_min} minutos",
+        n_speakers=n_speakers,
+    )
+
+    # Sólo si hay nombres: insertamos el bloque antes de las instrucciones de
+    # estructura. Sin nombres, prompt_usuario queda idéntico al de siempre.
+    if nombres:
+        prompt_usuario = prompt_usuario.replace(
+            _ANCLA_INSTRUCCIONES,
+            _bloque_nombres(nombres) + "\n" + _ANCLA_INSTRUCCIONES,
+            1,
+        )
 
     message = client.messages.create(
         model="claude-sonnet-5",          # Sonnet vigente (el id 4-20250514 devuelve 404)
@@ -176,12 +234,7 @@ def generar_acta(transcripcion: str, duracion_min: int, n_speakers: int) -> str:
         system=SYSTEM_PROMPT,
         messages=[{
             "role": "user",
-            "content": ACTA_PROMPT.format(
-                transcripcion=transcripcion,
-                fecha=datetime.now().strftime("%d/%m/%Y"),
-                duracion=f"~{duracion_min} minutos",
-                n_speakers=n_speakers,
-            ),
+            "content": prompt_usuario,
         }],
     )
 
