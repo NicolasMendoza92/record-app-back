@@ -103,7 +103,8 @@ def verificar_password(x_app_password: str = Header(default="")):
 # ── almacén de jobs en memoria ──────────────────────────────────────────────
 # La free tier de Render es UNA sola instancia sin autoscaling, así que un dict
 # en memoria alcanza. Un redeploy pierde los jobs en vuelo — aceptable y esperado.
-# Cada job: {estado, resultado, error, actualizado}.
+# Cada job: {estado, resultado, error, actualizado, + transcripcion/duracion_min/
+# n_speakers/nombres una vez transcripto (para no perderlo si el acta falla)}.
 # estado ∈ subiendo | transcribiendo | redactando | listo | error
 JOBS: dict[str, dict] = {}
 _JOBS_LOCK = threading.Lock()
@@ -130,43 +131,76 @@ def _set_job(jid: str, **campos) -> None:
             j["actualizado"] = time.time()
 
 
-def _procesar_job(jid: str, audio_path: str, speakers: int, nombres: list[str]) -> None:
-    """Corre en un thread aparte: transcribe + redacta el acta y va actualizando el job.
+def _borrar_archivo(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
-    El SDK de AssemblyAI y la llamada a Claude son bloqueantes; por eso esto vive
-    en un thread y no en el event loop. El endpoint ya respondió 202.
+
+def _procesar_job(jid: str, audio_path: str, speakers: int, nombres: list[str]) -> None:
+    """Corre en un thread aparte: transcribe y luego redacta el acta.
+
+    Apenas la transcripción está lista se GUARDA en el job. Así, si el acta falla,
+    no se pierde la transcripción (que ya se pagó) y se puede reintentar sólo el
+    acta sin volver a llamar a AssemblyAI. El SDK y Claude son bloqueantes; por eso
+    esto vive en un thread y no en el event loop. El endpoint ya respondió 202.
     """
     try:
         _set_job(jid, estado="transcribiendo")
         stt = transcribir_audio(audio_path, n_speakers=speakers)
-
         duracion_min = max(1, int(stt.duracion_seg // 60)) if stt.duracion_seg else 0
-
-        _set_job(jid, estado="redactando")
-        acta = generar_acta(
-            stt.texto,
+        # ── checkpoint: la transcripción queda persistida en el job ──
+        _set_job(
+            jid,
+            transcripcion=stt.texto,
             duracion_min=duracion_min,
-            n_speakers=stt.n_speakers,
+            n_speakers=stt.n_speakers,   # cantidad detectada por el proveedor
+            nombres=nombres,             # se guarda para poder reintentar el acta
+        )
+    except Exception as e:
+        logger.exception("Fallo transcribiendo job %s", jid)
+        _set_job(jid, estado="error", error=f"{type(e).__name__}: {e}")
+        _borrar_archivo(audio_path)
+        return
+
+    # el audio ya no se necesita: el reintento sólo re-redacta sobre la transcripción
+    _borrar_archivo(audio_path)
+    _redactar_acta(jid)
+
+
+def _redactar_acta(jid: str) -> None:
+    """Redacta el acta a partir de la transcripción ya guardada en el job.
+
+    Se usa tanto en el flujo normal como en el reintento. No re-transcribe nada.
+    """
+    with _JOBS_LOCK:
+        j = JOBS.get(jid)
+        if j is None or j.get("transcripcion") is None:
+            return
+        transcripcion = j["transcripcion"]
+        duracion_min = j["duracion_min"]
+        n_speakers = j["n_speakers"]
+        nombres = j.get("nombres") or []
+
+    _set_job(jid, estado="redactando", error=None)
+    try:
+        acta = generar_acta(
+            transcripcion,
+            duracion_min=duracion_min,
+            n_speakers=n_speakers,
             nombres=nombres,   # opcional; [] deja el prompt como siempre
         )
-
-        _set_job(jid, estado="listo", resultado={
-            "transcripcion": stt.texto,
+        _set_job(jid, estado="listo", error=None, resultado={
+            "transcripcion": transcripcion,
             "acta": acta,
             "duracion_min": duracion_min,
-            "n_speakers": stt.n_speakers,   # cantidad detectada por el proveedor
+            "n_speakers": n_speakers,
         })
-
     except Exception as e:
-        logger.exception("Fallo procesando job %s", jid)
+        # la transcripción sigue guardada en el job: no se pierde, se puede reintentar
+        logger.exception("Fallo redactando acta del job %s", jid)
         _set_job(jid, estado="error", error=f"{type(e).__name__}: {e}")
-
-    finally:
-        # el archivo temporal se borra pase lo que pase
-        try:
-            os.remove(audio_path)
-        except OSError:
-            pass
 
 
 @app.get("/health")
@@ -206,7 +240,17 @@ async def endpoint_transcribir(
     _limpiar_jobs()
     jid = uuid.uuid4().hex
     with _JOBS_LOCK:
-        JOBS[jid] = {"estado": "subiendo", "resultado": None, "error": None, "actualizado": time.time()}
+        JOBS[jid] = {
+            "estado": "subiendo",
+            "resultado": None,
+            "error": None,
+            "actualizado": time.time(),
+            # se completan al terminar la transcripción (checkpoint anti-pérdida)
+            "transcripcion": None,
+            "duracion_min": None,
+            "n_speakers": None,
+            "nombres": nombres_asistentes,
+        }
 
     threading.Thread(
         target=_procesar_job,
@@ -219,9 +263,44 @@ async def endpoint_transcribir(
 
 @app.get("/transcribir/{job_id}", dependencies=[Depends(verificar_password)])
 def estado_job(job_id: str):
-    """Estado del job para el polling del front."""
+    """Estado del job para el polling del front.
+
+    Incluye 'parcial' con la transcripción apenas está disponible: si el acta
+    falla, el front la muestra igual (no se pierde lo ya transcripto/pagado).
+    """
     with _JOBS_LOCK:
         j = JOBS.get(job_id)
         if j is None:
             raise HTTPException(status_code=404, detail="Job desconocido o expirado")
-        return {"estado": j["estado"], "resultado": j["resultado"], "error": j["error"]}
+        parcial = None
+        if j.get("transcripcion") is not None:
+            parcial = {
+                "transcripcion": j["transcripcion"],
+                "duracion_min": j["duracion_min"],
+                "n_speakers": j["n_speakers"],
+            }
+        return {
+            "estado": j["estado"],
+            "resultado": j["resultado"],
+            "error": j["error"],
+            "parcial": parcial,
+        }
+
+
+@app.post("/transcribir/{job_id}/acta", status_code=202, dependencies=[Depends(verificar_password)])
+def reintentar_acta(job_id: str):
+    """Reintenta SOLO la redacción del acta sobre la transcripción ya guardada.
+
+    No re-transcribe (no re-cobra AssemblyAI). El front vuelve a poletear el job.
+    """
+    with _JOBS_LOCK:
+        j = JOBS.get(job_id)
+        if j is None:
+            raise HTTPException(status_code=404, detail="Job desconocido o expirado")
+        if j.get("transcripcion") is None:
+            raise HTTPException(status_code=409, detail="El job no tiene una transcripción para redactar")
+        if j["estado"] in ("transcribiendo", "redactando"):
+            raise HTTPException(status_code=409, detail="El job ya está en curso")
+
+    threading.Thread(target=_redactar_acta, args=(job_id,), daemon=True).start()
+    return {"job_id": job_id}
