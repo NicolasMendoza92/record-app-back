@@ -6,15 +6,17 @@ Archivo: back/main.py  (el Procfile y Render apuntan a este)
 import os
 import re
 import json
+import time
+import uuid
 import shutil
 import secrets
 import tempfile
 import logging
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 from transcriptor import transcribir_audio, generar_acta
 
@@ -98,11 +100,73 @@ def verificar_password(x_app_password: str = Header(default="")):
         raise HTTPException(status_code=401, detail="No autorizado")
 
 
-class ResultadoTranscripcion(BaseModel):
-    transcripcion: str
-    acta: str
-    duracion_min: int
-    n_speakers: int
+# ── almacén de jobs en memoria ──────────────────────────────────────────────
+# La free tier de Render es UNA sola instancia sin autoscaling, así que un dict
+# en memoria alcanza. Un redeploy pierde los jobs en vuelo — aceptable y esperado.
+# Cada job: {estado, resultado, error, actualizado}.
+# estado ∈ subiendo | transcribiendo | redactando | listo | error
+JOBS: dict[str, dict] = {}
+_JOBS_LOCK = threading.Lock()
+_JOB_TTL_SEG = 30 * 60  # se limpian los jobs terminados a los 30 min
+
+
+def _limpiar_jobs() -> None:
+    """Borra jobs terminados (listo/error) más viejos que el TTL. Evita fugar memoria."""
+    corte = time.time() - _JOB_TTL_SEG
+    with _JOBS_LOCK:
+        muertos = [
+            jid for jid, j in JOBS.items()
+            if j["estado"] in ("listo", "error") and j["actualizado"] < corte
+        ]
+        for jid in muertos:
+            JOBS.pop(jid, None)
+
+
+def _set_job(jid: str, **campos) -> None:
+    with _JOBS_LOCK:
+        j = JOBS.get(jid)
+        if j is not None:
+            j.update(campos)
+            j["actualizado"] = time.time()
+
+
+def _procesar_job(jid: str, audio_path: str, speakers: int, nombres: list[str]) -> None:
+    """Corre en un thread aparte: transcribe + redacta el acta y va actualizando el job.
+
+    El SDK de AssemblyAI y la llamada a Claude son bloqueantes; por eso esto vive
+    en un thread y no en el event loop. El endpoint ya respondió 202.
+    """
+    try:
+        _set_job(jid, estado="transcribiendo")
+        stt = transcribir_audio(audio_path, n_speakers=speakers)
+
+        duracion_min = max(1, int(stt.duracion_seg // 60)) if stt.duracion_seg else 0
+
+        _set_job(jid, estado="redactando")
+        acta = generar_acta(
+            stt.texto,
+            duracion_min=duracion_min,
+            n_speakers=stt.n_speakers,
+            nombres=nombres,   # opcional; [] deja el prompt como siempre
+        )
+
+        _set_job(jid, estado="listo", resultado={
+            "transcripcion": stt.texto,
+            "acta": acta,
+            "duracion_min": duracion_min,
+            "n_speakers": stt.n_speakers,   # cantidad detectada por el proveedor
+        })
+
+    except Exception as e:
+        logger.exception("Fallo procesando job %s", jid)
+        _set_job(jid, estado="error", error=f"{type(e).__name__}: {e}")
+
+    finally:
+        # el archivo temporal se borra pase lo que pase
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass
 
 
 @app.get("/health")
@@ -117,23 +181,21 @@ def verificar():
     return {"ok": True}
 
 
-@app.post(
-    "/transcribir",
-    response_model=ResultadoTranscripcion,
-    dependencies=[Depends(verificar_password)],
-)
+@app.post("/transcribir", status_code=202, dependencies=[Depends(verificar_password)])
 async def endpoint_transcribir(
     audio: UploadFile = File(...),
     speakers: int = Form(default=2, ge=1, le=10),
     nombres: str = Form(default="[]"),
 ):
+    """Arranca el job y devuelve 202 con el job_id. El trabajo pesado corre en un
+    thread; el front poletea GET /transcribir/{job_id} hasta que esté 'listo'."""
     extensiones_ok = {".mp3", ".m4a", ".mp4", ".wav", ".ogg", ".flac", ".webm", ".opus"}
     ext = Path(audio.filename or "").suffix.lower()
     if ext not in extensiones_ok:
         raise HTTPException(status_code=400, detail=f"Formato no soportado: {ext}")
 
-    # Volcamos el audio a un archivo temporal SIN cargarlo entero a memoria: la
-    # instancia free de Render tiene 512 MB y una reunión de 1h pesa decenas de MB.
+    # El audio se vuelca a disco DENTRO de la request (el UploadFile se cierra al
+    # responder); el thread trabaja después sobre esa ruta. Sin cargarlo a memoria.
     audio.file.seek(0)
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext or ".tmp") as tmp:
         shutil.copyfileobj(audio.file, tmp)
@@ -141,34 +203,25 @@ async def endpoint_transcribir(
 
     nombres_asistentes = sanear_nombres(nombres)  # [] si no vino nada o vino malformado
 
-    try:
-        # 'speakers' del front se usa como número de hablantes esperado.
-        stt = transcribir_audio(audio_path, n_speakers=speakers)
+    _limpiar_jobs()
+    jid = uuid.uuid4().hex
+    with _JOBS_LOCK:
+        JOBS[jid] = {"estado": "subiendo", "resultado": None, "error": None, "actualizado": time.time()}
 
-        duracion_min = max(1, int(stt.duracion_seg // 60)) if stt.duracion_seg else 0
+    threading.Thread(
+        target=_procesar_job,
+        args=(jid, audio_path, speakers, nombres_asistentes),
+        daemon=True,
+    ).start()
 
-        acta = generar_acta(
-            stt.texto,
-            duracion_min=duracion_min,
-            n_speakers=stt.n_speakers,
-            nombres=nombres_asistentes,   # opcional; [] deja el prompt como siempre
-        )
+    return {"job_id": jid}
 
-        return ResultadoTranscripcion(
-            transcripcion=stt.texto,
-            acta=acta,
-            duracion_min=duracion_min,
-            n_speakers=stt.n_speakers,   # cantidad detectada por el proveedor
-        )
 
-    except Exception as e:
-        # Log del traceback completo en el servidor (antes solo se veía "500").
-        logger.exception("Fallo procesando /transcribir")
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-
-    finally:
-        # el archivo temporal se borra pase lo que pase
-        try:
-            os.remove(audio_path)
-        except OSError:
-            pass
+@app.get("/transcribir/{job_id}", dependencies=[Depends(verificar_password)])
+def estado_job(job_id: str):
+    """Estado del job para el polling del front."""
+    with _JOBS_LOCK:
+        j = JOBS.get(job_id)
+        if j is None:
+            raise HTTPException(status_code=404, detail="Job desconocido o expirado")
+        return {"estado": j["estado"], "resultado": j["resultado"], "error": j["error"]}
